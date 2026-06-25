@@ -13,7 +13,6 @@ import java.io.IOException
 import java.lang.Thread.sleep
 import java.net.InetAddress
 import java.nio.file.Files
-import java.nio.file.InvalidPathException
 import java.nio.file.attribute.PosixFilePermissions
 import java.util.EnumSet
 import java.util.concurrent.SynchronousQueue
@@ -31,6 +30,11 @@ import misk.web.jetty.JettyHealthService.Companion.jettyHealthServiceEnabled
 import misk.web.mediatype.MediaTypes
 import okhttp3.HttpUrl
 import org.eclipse.jetty.alpn.server.ALPNServerConnectionFactory
+import org.eclipse.jetty.ee9.servlet.FilterHolder
+import org.eclipse.jetty.ee9.servlet.ServletContextHandler
+import org.eclipse.jetty.ee9.servlet.ServletHolder
+import org.eclipse.jetty.ee9.servlets.CrossOriginFilter
+import org.eclipse.jetty.ee9.websocket.server.config.JettyWebSocketServletContainerInitializer
 import org.eclipse.jetty.http.UriCompliance
 import org.eclipse.jetty.http2.server.AbstractHTTP2ServerConnectionFactory
 import org.eclipse.jetty.http2.server.HTTP2CServerConnectionFactory
@@ -48,17 +52,10 @@ import org.eclipse.jetty.server.SslConnectionFactory
 import org.eclipse.jetty.server.handler.ContextHandler
 import org.eclipse.jetty.server.handler.StatisticsHandler
 import org.eclipse.jetty.server.handler.gzip.GzipHandler
-import org.eclipse.jetty.servlet.FilterHolder
-import org.eclipse.jetty.servlet.ServletContextHandler
-import org.eclipse.jetty.servlet.ServletHolder
-import org.eclipse.jetty.servlets.CrossOriginFilter
 import org.eclipse.jetty.unixdomain.server.UnixDomainServerConnector
-import org.eclipse.jetty.unixsocket.server.UnixSocketConnector
 import org.eclipse.jetty.util.JavaVersion
-import org.eclipse.jetty.util.MultiException
 import org.eclipse.jetty.util.ssl.SslContextFactory
 import org.eclipse.jetty.util.thread.ThreadPool
-import org.eclipse.jetty.websocket.server.config.JettyWebSocketServletContainerInitializer
 
 @Singleton
 class JettyService
@@ -266,51 +263,43 @@ internal constructor(
         udsConnFactories.add(http2)
       }
 
-      if (isJEP380Supported(socketConfig.path)) {
-        logger.info("Using UnixDomainServerConnector for ${socketConfig.path}")
-        val udsConnector =
-          UnixDomainServerConnector(
-            server,
-            null /* executor */,
-            null /* scheduler */,
-            null /* buffer pool */,
-            webConfig.acceptors ?: -1,
-            webConfig.selectors ?: -1,
-            *udsConnFactories.toTypedArray(),
-          )
-        val socketFile = File(socketConfig.path)
-        udsConnector.unixDomainPath = socketFile.toPath()
-        udsConnector.addBean(connectionMetricsCollector.newConnectionListener("http", 0))
-        udsConnector.name = "uds"
-
-        // try to clean up any leftover socket files before connecting
-        if (socketFile.exists() && !socketFile.delete()) {
-          logger.warn("Could not delete file $socketFile")
-        }
-
-        // set file permissions after socket creation so sidecars (e.g. envoy, istio) have access
-        try {
-          udsConnector.start()
-          setFilePermissions(socketFile)
-        } catch (e: Exception) {
-          cleanAndThrow(udsConnector, e)
-        }
-        server.addConnector(udsConnector)
-      } else {
-        val udsConnector =
-          UnixSocketConnector(
-            server,
-            null /* executor */,
-            null /* scheduler */,
-            null /* buffer pool */,
-            webConfig.selectors ?: -1,
-            *udsConnFactories.toTypedArray(),
-          )
-        udsConnector.setUnixSocket(socketConfig.path)
-        udsConnector.addBean(connectionMetricsCollector.newConnectionListener("http", 0))
-        udsConnector.name = "uds"
-        server.addConnector(udsConnector)
+      if (!isJEP380Supported(socketConfig.path)) {
+        // Jetty 12 dropped the jnr-unixsocket fallback (UnixSocketConnector). Only JEP-380
+        // filesystem paths are supported. Abstract socket paths (prefixed with '@' or '\0') are
+        // no longer addressable from misk.
+        error("Unix domain socket path '${socketConfig.path}' is not supported on this JVM. " +
+          "Jetty 12 requires JEP-380 (JDK 16+) and concrete filesystem paths; abstract socket addresses are unsupported.")
       }
+
+      logger.info("Using UnixDomainServerConnector for ${socketConfig.path}")
+      val udsConnector =
+        UnixDomainServerConnector(
+          server,
+          null /* executor */,
+          null /* scheduler */,
+          null /* buffer pool */,
+          webConfig.acceptors ?: -1,
+          webConfig.selectors ?: -1,
+          *udsConnFactories.toTypedArray(),
+        )
+      val socketFile = File(socketConfig.path)
+      udsConnector.unixDomainPath = socketFile.toPath()
+      udsConnector.addBean(connectionMetricsCollector.newConnectionListener("http", 0))
+      udsConnector.name = "uds"
+
+      // try to clean up any leftover socket files before connecting
+      if (socketFile.exists() && !socketFile.delete()) {
+        logger.warn("Could not delete file $socketFile")
+      }
+
+      // set file permissions after socket creation so sidecars (e.g. envoy, istio) have access
+      try {
+        udsConnector.start()
+        setFilePermissions(socketFile)
+      } catch (e: Exception) {
+        cleanAndThrow(udsConnector, e)
+      }
+      server.addConnector(udsConnector)
     }
 
     // TODO(mmihic): Force security handler?
@@ -319,9 +308,9 @@ internal constructor(
     servletContextHandler.addServlet(ServletHolder(webActionsServlet), "/*")
 
     JettyWebSocketServletContainerInitializer.configure(servletContextHandler, null)
-    server.addManaged(servletContextHandler)
+    server.addManaged(servletContextHandler.coreContextHandler)
 
-    statisticsHandler.handler = servletContextHandler
+    statisticsHandler.handler = servletContextHandler.coreContextHandler
     statisticsHandler.server = server
 
     // Kubernetes sends a SIG_TERM and gives us 30 seconds to stop gracefully.
@@ -370,18 +359,7 @@ internal constructor(
       val stopwatch = Stopwatch.createStarted()
       logger.info("Stopping Jetty")
 
-      try {
-        server.stop()
-      } catch (_: InvalidPathException) {
-        // Currently we get a nul character exception since an abstract socket address is
-        // distinguished from a regular unix socket by the fact that the first byte of
-        // the address is a null byte ('\0'). The address has no connection with filesystem
-        // path names.
-      } catch (e: MultiException) {
-        // Jetty wraps multiple InvalidPathExceptions into a MultiException when stopping
-        // multiple abstract unix domain sockets (addresses starting with '\0').
-        if (!isOnlyInvalidPathExceptions(e)) throw e
-      }
+      server.stop()
 
       logger.info { "Stopped Jetty in $stopwatch" }
     }
@@ -436,11 +414,11 @@ private val Server.httpsUrl: HttpUrl?
   }
 
 internal fun NetworkConnector.toHttpUrl(): HttpUrl {
-  val context = server.getChildHandlerByClass(ContextHandler::class.java)
+  val context = server.descendants.filterIsInstance<ContextHandler>().firstOrNull()
   val protocol = defaultConnectionFactory.protocol
   val scheme = if (protocol.startsWith("SSL-") || protocol == "SSL") "https" else "http"
 
-  val virtualHosts = context?.virtualHosts ?: arrayOf<String>()
+  val virtualHosts = context?.virtualHosts?.toTypedArray() ?: arrayOf<String>()
   val explicitHost = if (virtualHosts.isEmpty()) host else virtualHosts[0]
 
   return HttpUrl.Builder()
@@ -468,10 +446,6 @@ private fun AbstractHTTP2ServerConnectionFactory.customize(webConfig: WebConfig)
   if (webConfig.jetty_initial_stream_recv_window != null) {
     initialStreamRecvWindow = webConfig.jetty_initial_stream_recv_window
   }
-}
-
-private fun isOnlyInvalidPathExceptions(e: MultiException): Boolean {
-  return e.throwables.isNotEmpty() && e.throwables.all { it is InvalidPathException }
 }
 
 /**

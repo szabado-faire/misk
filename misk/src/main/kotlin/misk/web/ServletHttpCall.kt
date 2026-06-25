@@ -10,7 +10,7 @@ import okhttp3.Headers
 import okhttp3.HttpUrl
 import okio.BufferedSink
 import okio.BufferedSource
-import org.eclipse.jetty.server.Request
+import org.eclipse.jetty.ee9.nested.Request
 
 internal data class ServletHttpCall(
   override val url: HttpUrl,
